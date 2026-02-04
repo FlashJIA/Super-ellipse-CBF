@@ -1,0 +1,4 @@
+source devel/setup.bash
+roslaunch raspimouse_gazebo main_multicolor_obstacle.launch
+rosrun raspberrypimouse_controlbarrierfunction CBF_in_traffic_obstacle.py
+

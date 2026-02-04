@@ -1,0 +1,216 @@
+#! /usr/bin/env python3
+import numpy as np
+from cvxopt import matrix, sparse
+from cvxopt.solvers import qp, options
+from scipy.integrate import odeint
+from math import *
+import time
+from cvxopt import matrix, solvers, sparse
+from scipy.spatial.distance import pdist, squareform
+from scipy.optimize import fsolve
+
+options['show_progress'] = False
+options['reltol'] = 1e-2 # was e-2
+options['feastol'] = 1e-2 # was e-4
+options['maxiters'] = 50 # default is 100
+
+def si_position_controller(xi, positions, x_velocity_gain=1, y_velocity_gain=1, velocity_magnitude_limit=0.5):
+    _,N = np.shape(xi)
+    dxi = np.zeros((2, N))
+
+        # Calculate control input
+    dxi[0][:] = np.round(x_velocity_gain*(positions[0][:]-xi[0][:]), 2)
+    dxi[1][:] = np.round(y_velocity_gain*(positions[1][:]-xi[1][:]), 2)
+
+        # Threshold magnitude
+    norms = np.linalg.norm(dxi, axis=0)
+    idxs = np.where(norms > velocity_magnitude_limit)
+    if norms[idxs].size != 0:
+        dxi[:, idxs] *= velocity_magnitude_limit/norms[idxs]
+
+    return dxi
+# /cube 0.5 1.2 cro 0.8 1.2
+def callSolve(Ox,Oy,Px,Py):
+    # print("Obstacle Position" , Ox, Oy)
+    # print("Agent Position" , Px, Py)
+    def func(x):
+        # return ((((Px-Ox)*x))/1.5)**4 + ((((Py-Oy)*x))/5)**4 - 1
+        return ((((Px-Ox)*x))/1)**4 + ((((Py-Oy)*x))/1.2)**4 - 1
+    # root = fsolve(func, 0.5)
+    root = 0
+    try:
+        root = fsolve(func, 0.5)
+    except RuntimeWarning:
+        root = fsolve(func, 2)
+    print([(Ox + (Px-Ox)*root),(Oy + (Py-Oy)*root)])
+    return [(Ox + (Px-Ox)*root),(Oy + (Py-Oy)*root)]
+
+def si_position_controller_2(xi, positions, x_velocity_gain=1, y_velocity_gain=1, velocity_magnitude_limit=0.7):
+    _,N = np.shape(xi)
+    dxi = np.zeros((2, N))
+
+        # Calculate control input
+    dxi[0][:] = (x_velocity_gain*(positions[0][:]-xi[0][:]))
+    dxi[1][:] = (y_velocity_gain*(positions[1][:]-xi[1][:]))
+
+        # Threshold magnitude
+    norms = np.linalg.norm(dxi, axis=0)
+    idxs = np.where(norms > velocity_magnitude_limit)
+    if norms[idxs].size != 0:
+        dxi[:, idxs] *= velocity_magnitude_limit/norms[idxs]
+
+    return dxi
+# 0.75
+def si_barrier_cert(dxi, x, obstacles, barrier_gain=100, safety_radius=0.3, magnitude_limit=0.5):
+    start_time = time.time()
+    N = dxi.shape[1]
+    num_constraints = int(comb(N, 2))
+    A = np.zeros((num_constraints, 2*N))
+    b = np.zeros(num_constraints)
+
+    # 初始化障碍物的约束数组
+    Aob = np.zeros((N * obstacles.shape[0], 2 * N))  # 使用 obstacles.shape[0] 代替 shape[1]
+    bob = np.zeros(N * obstacles.shape[0])
+
+    H = sparse(matrix(2*np.identity(2*N)))
+    count = 0
+    countObstacles = 0
+
+    # 处理机器人之间的障碍
+    for i in range(N-1):
+        for j in range(i+1, N):
+            error = x[:, i] - x[:, j]
+            h = np.sum(error**2) - safety_radius**2
+            A[count, 2*i:2*i+2] = -2*error
+            A[count, 2*j:2*j+2] = 2*error
+            b[count] = barrier_gain * pow(h, 3)
+            count += 1
+
+    # 处理机器人与障碍物之间的障碍
+    
+    for i in range(N):
+        for k in range(obstacles.shape[0]):
+            Ox, Oy = obstacles[k, :2]
+            Px, Py = x[:, i]
+            # 转换到以障碍物为原点的坐标
+            Px_prime, Py_prime = Px - Ox, Py - Oy
+            obstacle_radius = callSolve(0, 0, Px_prime, Py_prime)
+            errorObs = np.array([Px_prime, Py_prime])
+            # print(sqrt(obstacle_radius[0]**2 + obstacle_radius[1]))
+            # print(sqrt(errorObs[0]**2 + errorObs[1]**2))
+            hObs = np.sqrt(errorObs[0]**2 + errorObs[1]**2) - np.sqrt(obstacle_radius[0]**2 + obstacle_radius[1]**2)
+            Aob[countObstacles, 2*i:2*i+2] = -2 * errorObs
+            bob[countObstacles] = barrier_gain * np.power(hObs, 3)
+            countObstacles += 1
+   
+    A = np.concatenate((A, Aob), axis=0)
+    b = np.concatenate((b, bob), axis=0)
+
+    norms = np.linalg.norm(dxi, axis=0)
+    # idxs_to_normalize = norms > magnitude_limit
+    # dxi[:, idxs_to_normalize] = (dxi[:, idxs_to_normalize] / norms[idxs_to_normalize]) * magnitude_limit
+    idxs_to_normalize = (norms > magnitude_limit)
+    dxi[:, idxs_to_normalize] *= magnitude_limit/norms[idxs_to_normalize]
+
+    f = -2 * np.reshape(dxi, 2*N, order='F')
+    result =qp(H, matrix(f), matrix(A), matrix(b))['x']
+    end_time = time.time()
+    # print(f"Function run time: {end_time - start_time} seconds")
+    return np.reshape(result, (2, -1), order='F')
+
+# def superellipse_barrier(error, radius):
+#     a = b = radius / 1.5  
+#     x, y = error
+#     h = ((x / a) ** 4 + (y / b) ** 4 - 1)
+#     return h
+
+    
+def robotFeedbackControl(xi, positions): #P controller
+    
+    #Feedback control parameter for REAL ROBOT
+    GOAL_DIST_THRESHOLD=0.08
+    K_RO=2
+    K_ALPHA=13
+    V_CONST=0.1
+
+    #Feedback control parameter for SIMULATED ROBOT
+    # GOAL_DIST_THRESHOLD=0.05
+    # K_RO=3
+    # K_ALPHA=13
+    # V_CONST=0.2
+
+    _,N = np.shape(xi)
+    dxi = np.zeros((2, N))
+
+    norms = np.linalg.norm(xi[0:2, 0:N]-positions, axis = 0)
+    lamda = np.arctan2(positions[1][:]-xi[1][:], positions[0][:]-xi[0][:])
+    alpha = np.array([(lamda[:] - xi[2][:] + pi) % (2 * pi) - pi]) #-360degrees
+    v = K_RO * norms
+    w = K_ALPHA * alpha
+
+    dxi[0][:] = np.round((v[:] / abs(v[:]) * V_CONST), 2)
+    dxi[1][:] = np.round((w[:] / abs(v[:]) * V_CONST), 2)
+
+    idxs = np.where(norms < GOAL_DIST_THRESHOLD)
+    dxi[:, idxs] = 0
+    return dxi
+
+def robotPDFeedbackControl(xi, positions, n, a, GOAL_DIST_THRESHOLD=0.05, K_RO=3, K_ALPHA=13, Kd_RO = 5, Kd_ALPHA = 5, V_CONST=0.3): #PD controller
+    _,N = np.shape(xi)
+    dxi = np.zeros((2, N))
+
+    norms = np.linalg.norm(xi[0:2, 0:N]-positions, axis = 0)
+    lamda = np.arctan2(positions[1][:]-xi[1][:], positions[0][:]-xi[0][:])
+    alpha = np.array([(lamda[:] - xi[2][:] + pi) % (2 * pi) - pi]) #-360degrees
+    d_norms = norms - n
+    d_alpha = alpha - a
+    v = (K_RO * norms) + (Kd_RO * d_norms)
+    w = (K_ALPHA * alpha) + (Kd_ALPHA * d_alpha)
+    n = norms
+    a = alpha
+    dxi[0][:] = v[:] / abs(v[:]) * V_CONST
+    dxi[1][:] = w[:] / abs(v[:]) * V_CONST
+    idxs = np.where(norms < GOAL_DIST_THRESHOLD)
+    dxi[:, idxs] = 0
+    return dxi, n, a
+
+def diff_equation_fatii(y_list,t,e,omega):
+    ki = 22
+    sum_fu = y_list[1] + e
+    coe = 0
+    for i in range(2,len(y_list)):
+        if i%2 == 0:
+            coe = int(i/2)
+            sum_fu += (y_list[i] + e*cos(coe*omega*t)) * cos(coe*omega*t)
+        else:
+            coe = int((i-1)/2)
+            sum_fu += (y_list[i] + e*sin(coe*omega*t)) * sin(coe*omega*t)
+
+        result = []
+        result.append(-ki*e-sum_fu + 20*cos(pi*t))
+        result.append(-e)
+    for i in range(2, len(y_list)):
+        if i%2 == 0:
+            coe = int(i/2)
+            result.append(coe*e*omega*sin(coe*omega*t) + ki*e*cos(coe*omega*t))
+        else:
+            coe = int((i-1)/2)
+            result.append((-e)*coe*omega*cos(coe*omega*t)+ki*e*sin(coe*omega*t))
+    return np.array(result)
+                     
+
+def cal_tra_fatii(new_coords,new_centroids):
+    T=5
+    t=np.linspace(0,T,num=1)
+    omega = pi*2/T
+    point_lists = []
+    for i in range(len(new_coords)):
+        y_list_x = [new_coords[i][0],0,0,0,0,0,0,0,0,0,0]
+        y_list_y = [new_coords[i][1],0,0,0,0,0,0,0,0,0,0]
+        result_x = odeint(diff_equation_fatii, y_list_x, t, args=(new_coords[i][0]-new_centroids[i][0],omega))
+        result_y = odeint(diff_equation_fatii, y_list_y, t, args=(new_coords[i][1]-new_centroids[i][1],omega))
+        result_xt = result_x[:,0]
+        result_yt = result_y[:,0]
+        new_result = np.vstack((np.array(result_xt), np.array(result_yt))).T
+        point_lists.append(list(new_result))
+    return point_lists
